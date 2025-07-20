@@ -1,0 +1,21 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+venv/
+env/
+.venv/
+.env/
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store  # macOS
+Thumbs.db  # Windows
+*.env
+.env
+config.ini
+build/
+dist/
+*.egg-info/
+*.log
