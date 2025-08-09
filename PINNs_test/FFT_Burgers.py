@@ -75,7 +75,6 @@ class FourierNN(nn.Module):
         x = self.fcs(x)
         x = self.fch(x)
         x = self.fce(x)
-        x = torch.fft.rfft2(x).real
         return x
 
 torch.manual_seed(123)
@@ -98,8 +97,10 @@ for epoch in range(1001):
     optimizer_burgers.zero_grad()
     lambda_0 = 10
     fre = pinn(input_train)
-    u = torch.fft.irfft2(fre, s=(len(x_train), len(t_train)))
-    loss_0 = torch.mean((torch.squeeze(u) - bound(x_train)) ** 2)
+    fre_grid = fre.reshape(len(t_train), len(x_train))
+    u = torch.fft.irfft2(fre_grid, s=(len(x_train), len(t_train)))
+    u_initial = u[0, :]
+    loss_0 = torch.mean((u_initial - bound(x_train)) ** 2)
 
     du = torch.autograd.grad(u, input_train, torch.ones_like(u), create_graph=True)[0]
     du_dt = du[:, 0].unsqueeze(1)
