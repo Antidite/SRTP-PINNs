@@ -1,15 +1,11 @@
 import torch
 import torch.autograd as autograd
 import torch.nn as nn
-import torch.optim as optim
-from torch import Tensor
-
-from sklearn.model_selection import train_test_split
-
 import numpy as np
 import time
 from pyDOE import lhs
 import scipy.io
+import os
 
 from plotting_utils import plot3D, plot3D_Matrix, solutionplot
 
@@ -28,11 +24,10 @@ print("Using: ", device)
 steps=10000
 lr=1e-1
 layers = np.array([2,20,20,20,20,20,20,20,20,1]) 
-N_boundary = 100 
-N_f = 10000 
+N_boundary = 100  
 nu = 0.01/np.pi #diffusion coefficient
-
-# --- Neural Network ---
+    
+# --- Neural Networks ---
 class FCN(nn.Module):
     def __init__(self, layers):
         super().__init__()
@@ -89,7 +84,7 @@ class FCN(nn.Module):
     
     def closure(self):
         optimizer.zero_grad()
-        loss = self.loss(X_boundary, U_boundary, X_train_Nf)
+        loss = self.loss(X_boundary, U_boundary, X_pde)
         loss.backward()
         self.iter += 1
         if self.iter % 100 == 0:
@@ -104,9 +99,64 @@ class FCN(nn.Module):
         u_pred = np.reshape(u_pred,(256,100),order='F')
     
         return error_vec, u_pred
-    
+
+class FourierPINN(FCN):
+    def __init__(self, layers, n_fourier_features=10, scale=10.0):
+        fourier_input_dim = 2 * n_fourier_features * 2
+
+        modified_layers = list(layers)
+        modified_layers[0] = fourier_input_dim
+        
+        super().__init__(modified_layers)
+
+        B_x = torch.randn((1, n_fourier_features)) * scale
+        B_t = torch.randn((1, n_fourier_features)) * scale
+        self.B_x = nn.Parameter(B_x, requires_grad=False).to(device)
+        self.B_t = nn.Parameter(B_t, requires_grad=False).to(device)
+        print(f"FourierPINN initialized. Input dimension changed from {layers[0]} to {fourier_input_dim}.")
+
+    def fourier_mapping(self, x_tensor):
+        x_coords = x_tensor[:, 0:1]
+        t_coords = x_tensor[:, 1:2]
+        
+        proj_x = x_coords @ self.B_x
+        proj_t = t_coords @ self.B_t
+        
+        features_x = torch.cat([torch.sin(proj_x), torch.cos(proj_x)], dim=1)
+        features_t = torch.cat([torch.sin(proj_t), torch.cos(proj_t)], dim=1)
+        
+        return torch.cat([features_x, features_t], dim=1)
+
+    def forward(self, x):
+        if not torch.is_tensor(x):         
+            x = torch.from_numpy(x).float().to(device)
+
+        u_b = torch.from_numpy(ub).float().to(device)
+        l_b = torch.from_numpy(lb).float().to(device)
+        x_normalized = (x - l_b) / (u_b - l_b)
+
+        features = self.fourier_mapping(x_normalized)
+        a = features.float()
+        for i in range(len(self.layers) - 1):
+            z = self.layers[i](a)
+            a = self.activation(z)
+
+        return self.layers[-1](a)
+
 # --- Data Preparation ---
-data = scipy.io.loadmat('./data/Burgers.mat')
+# Automatically calculate the file path
+try:
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    data_path = os.path.join(script_dir, 'data', 'Burgers.mat')
+    print(f"Attempting to load file from the following absolute path: {data_path}")
+    data = scipy.io.loadmat(data_path)
+
+except NameError:
+    print("Running in an interactive environment. Please ensure the working directory is correct or specify the path manually.")
+    data_path = 'data/Burgers.mat'
+    print(f"Attempting to use relative path: {data_path}")
+    data = scipy.io.loadmat(data_path)
+
 x = data['x']
 t = data['t']
 usol = data['usol']
@@ -139,19 +189,18 @@ idx = np.random.choice(X_train.shape[0], N_boundary, replace=False)
 X_boundary = X_train[idx, :]
 U_boundary = U_train[idx, :]
 
-#Latin Hypercube sampling
-X_train_Nf = lb + (ub - lb) * lhs(2, N_f)
-X_train_Nf = np.vstack((X_train_Nf, X_boundary))  # Combine with boundary points
+X_pde = X_test
+X_pde = np.vstack((X_pde, X_boundary))  # Combine with boundary points
 
 # --- Train ---
-X_train_Nf = torch.from_numpy(X_train_Nf).float().to(device)
+X_pde = torch.from_numpy(X_pde).float().to(device)
 X_boundary = torch.from_numpy(X_boundary).float().to(device)
 U_boundary = torch.from_numpy(U_boundary).float().to(device)
 X_test = torch.from_numpy(X_test).float().to(device)
 u = torch.from_numpy(u_true).float().to(device)
-f_hat = torch.zeros(X_train_Nf.shape[0],1).to(device)
+f_hat = torch.zeros(X_pde.shape[0],1).to(device)
 
-PINN = FCN(layers)
+PINN = FourierPINN(layers)
 PINN.to(device)
 
 optimizer = torch.optim.LBFGS(PINN.parameters(), lr, 
@@ -170,7 +219,7 @@ error_vec, u_pred = PINN.test()
 print('Test Error: %.5f'  % (error_vec))
 
 # --- plots ---
-solutionplot(u_pred, X_train_Nf.cpu().detach().numpy(), usol, x, t)
+solutionplot(u_pred, X_pde.cpu().detach().numpy(), usol, x, t)
 
 x1=X_test[:,0]
 t1=X_test[:,1]
