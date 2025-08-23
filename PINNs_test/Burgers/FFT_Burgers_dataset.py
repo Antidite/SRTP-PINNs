@@ -1,13 +1,14 @@
+import numpy as np
+import os
+import scipy.io
 import torch
 import torch.autograd as autograd
 import torch.nn as nn
-import numpy as np
 import time
-from pyDOE import lhs
-import scipy.io
-import os
 
 from plotting_utils import plot3D, plot3D_Matrix, solutionplot
+from pyDOE import lhs
+from torch.utils.tensorboard import SummaryWriter
 
 """
 Form of the Burgers' equation: u_t + u * u_x - nu * u_xx = 0, u(x, 0) = -sin(pi*x)
@@ -89,8 +90,10 @@ class FCN(nn.Module):
         loss.backward()
         self.iter += 1
         if self.iter % 100 == 0:
-            error_vec, _ = PINN.test()
+            error_vec, _ = self.test()
             print("Iter: {}, Loss: {}, Error: {}".format(self.iter, loss.item(), error_vec))
+            if hasattr(self, 'writer'):
+                self.writer.add_scalar('Loss/train', loss.item(), self.iter)
         return loss
 
     def test(self):
@@ -201,10 +204,13 @@ X_test = torch.from_numpy(X_test).float().to(device)
 u = torch.from_numpy(u_true).float().to(device)
 f_hat = torch.zeros(X_pde.shape[0],1).to(device)
 
-PINN = FourierPINN(layers)
-PINN.to(device)
+# FCN
+print("\n--- Training Standard FCN Model ---")
+pinn_fcn = FCN(layers)
+pinn_fcn.to(device)
+pinn_fcn.writer = SummaryWriter('runs/Standard_FCN') 
 
-optimizer = torch.optim.LBFGS(PINN.parameters(), lr, 
+optimizer = torch.optim.LBFGS(pinn_fcn.parameters(), lr, 
                               max_iter = steps, 
                               max_eval = None, 
                               tolerance_grad = 1e-11, 
@@ -212,12 +218,34 @@ optimizer = torch.optim.LBFGS(PINN.parameters(), lr,
                               history_size = 100, 
                               line_search_fn = 'strong_wolfe')
 start_time = time.time()
-optimizer.step(PINN.closure)
+optimizer.step(pinn_fcn.closure)
+pinn_fcn.writer.close()
 elapsed = time.time() - start_time                
-print('Training time: %.2f' % (elapsed))
+print('FCN Training time: %.2f seconds' % (elapsed))
+error_vec, _ = pinn_fcn.test()
+print('FCN Test Error: %.5f'  % (error_vec))
 
-error_vec, u_pred = PINN.test()
-print('Test Error: %.5f'  % (error_vec))
+
+# FourierPINN 
+print("\n--- Training FourierPINN Model ---")
+pinn_fourier = FourierPINN(layers)
+pinn_fourier.to(device)
+pinn_fourier.writer = SummaryWriter('runs/Fourier_PINN')
+
+optimizer = torch.optim.LBFGS(pinn_fourier.parameters(), lr, 
+                              max_iter = steps, 
+                              max_eval = None, 
+                              tolerance_grad = 1e-11, 
+                              tolerance_change = 1e-11, 
+                              history_size = 100, 
+                              line_search_fn = 'strong_wolfe')
+start_time = time.time()
+optimizer.step(pinn_fourier.closure)
+pinn_fourier.writer.close()
+elapsed = time.time() - start_time                
+print('FourierPINN Training time: %.2f seconds' % (elapsed))
+error_vec, u_pred = pinn_fourier.test()
+print('FourierPINN Test Error: %.5f'  % (error_vec))
 
 # --- plots ---
 solutionplot(u_pred, X_pde.cpu().detach().numpy(), usol, x, t)
