@@ -25,6 +25,7 @@ steps=10000
 lr=1e-1
 layers = np.array([2,20,20,20,20,20,20,20,20,1]) 
 N_boundary = 100  
+N_f = 10000 
 nu = 0.01/np.pi #diffusion coefficient
     
 # --- Neural Networks ---
@@ -113,7 +114,6 @@ class FourierPINN(FCN):
         B_t = torch.randn((1, n_fourier_features)) * scale
         self.B_x = nn.Parameter(B_x, requires_grad=False).to(device)
         self.B_t = nn.Parameter(B_t, requires_grad=False).to(device)
-        print(f"FourierPINN initialized. Input dimension changed from {layers[0]} to {fourier_input_dim}.")
 
     def fourier_mapping(self, x_tensor):
         x_coords = x_tensor[:, 0:1]
@@ -189,7 +189,8 @@ idx = np.random.choice(X_train.shape[0], N_boundary, replace=False)
 X_boundary = X_train[idx, :]
 U_boundary = U_train[idx, :]
 
-X_pde = X_test
+#Latin Hypercube Sampling
+X_pde = lb + (ub - lb) * lhs(2, N_f)
 X_pde = np.vstack((X_pde, X_boundary))  # Combine with boundary points
 
 # --- Train ---
