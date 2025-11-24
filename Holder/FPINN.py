@@ -132,39 +132,58 @@ class FourierPINN(nn.Module):
 
         return error_vec, u_pred
 
+#
+class WaveletFeatures(nn.Module):
+
+    def __init__(self, centers: torch.Tensor, scales: torch.Tensor):
+        super().__init__()
+        self.register_buffer("centers", centers)  # (M,2)
+        self.register_buffer("scales", scales)    # (M,2)
+
+    def bump(self, xi):
+
+        out = torch.zeros_like(xi)
+        mask = (xi.abs() < 1.0)
+        z = xi[mask]
+        out[mask] = torch.exp(-1.0 / (1.0 - z**2))
+        return out
+
+    def wavelet_1d(self, xi):
+
+        b = self.bump(xi)
+        return (1.0 - 2.0 * xi**2) * b
+
+    def forward(self, X):
+
+        x = X[:, 0:1]  # (N,1)
+        t = X[:, 1:2]  # (N,1)
+
+        # centers: (M,2), scales: (M,2)
+        cx = self.centers[:, 0].unsqueeze(0)  # (1,M)
+        ct = self.centers[:, 1].unsqueeze(0)  # (1,M)
+        sx = self.scales[:, 0].unsqueeze(0)   # (1,M)
+        st = self.scales[:, 1].unsqueeze(0)   # (1,M)
+
+        xi_x = (x - cx) / sx
+        xi_t = (t - ct) / st
+
+        psi_x = self.wavelet_1d(xi_x)
+        psi_t = self.wavelet_1d(xi_t)
+
+        features = psi_x * psi_t  # (N,M)
+        return features
+
+
 # Local Wavelet PINN
 class WavePINN(nn.Module):
-    def __init__(self, layers, nu, device):
+    def __init__(self, wavelet_features: WaveletFeatures, M: int):
         super().__init__()
-        self.nu = nu
-        self.device = device
-        self.activation = nn.Tanh()
-        self.loss_fn = nn.MSELoss()
+        self.wavelet_features = wavelet_features
+        self.linear = nn.Linear(M, 1, bias=False)
 
-        self.layers = nn.ModuleList(
-            [nn.Linear(layers[i], layers[i+1]) for i in range(len(layers)-1)]
-        )
-        for l in self.layers:
-            nn.init.xavier_normal_(l.weight)
-            nn.init.zeros_(l.bias)
-
-    def forward(self, x):
-        a = x
-        for l in self.layers[:-1]:
-            a = self.activation(l(a))
-        return self.layers[-1](a)
-
-    def pde_residual(self, X_interior):
-        X_interior.requires_grad_(True)
-        u = self.forward(X_interior)
-        grads = autograd.grad(u, X_interior, torch.ones_like(u),create_graph=True)[0]
-        u_x = grads[:, 0:1]
-        u_t = grads[:, 1:2]
-        grads2 = autograd.grad(u_x, X_interior, torch.ones_like(u_x),create_graph=True)[0]
-        u_xx = grads2[:, 0:1]
-
-        f = u_t + u * u_x - self.nu * u_xx
-        return f
+    def forward(self, X):
+        phi = self.wavelet_features(X)  # (N,M)
+        return self.linear(phi)         # (N,1)
 
 
 
@@ -251,6 +270,53 @@ def sample_patch_boundary(lb_patch, ub_patch, N_each_side):
     X_b = np.vstack([left, right, bottom, top])
     return X_b
 
+def u_total(X):
+    # X: (N,2) tensor
+    with torch.no_grad():
+        u_global = pinn_fourier(X)
+    delta_u = wavelet_correction(X)
+    return u_global + delta_u
+
+def pde_residual_wavelet(X):
+    X.requires_grad_(True)
+    u = u_total(X)
+    grads = autograd.grad(u, X, torch.ones_like(u),
+                          create_graph=True, retain_graph=True)[0]
+    u_x = grads[:, 0:1]
+    u_t = grads[:, 1:2]
+
+    grads2 = autograd.grad(u_x, X, torch.ones_like(u_x),
+                           create_graph=True, retain_graph=True)[0]
+    u_xx = grads2[:, 0:1]
+
+    f = u_t + u * u_x - nu * u_xx
+    return f
+
+def compute_region_errors(u_pred_mat, usol_mat, x_grid, t_grid, lb_patch, ub_patch):
+
+    x_vec = x_grid.flatten()
+    t_vec = t_grid.flatten()
+
+    X_mat, T_mat = np.meshgrid(x_vec, t_vec, indexing='ij')
+
+    mask_patch = (
+        (X_mat >= lb_patch[0]) & (X_mat <= ub_patch[0]) &
+        (T_mat >= lb_patch[1]) & (T_mat <= ub_patch[1])
+    )
+
+    diff_all = usol_mat - u_pred_mat
+    err_all = np.linalg.norm(diff_all) / np.linalg.norm(usol_mat)
+
+    diff_patch = diff_all[mask_patch]
+    true_patch = usol_mat[mask_patch]
+    err_patch = np.linalg.norm(diff_patch) / np.linalg.norm(true_patch)
+
+    diff_out = diff_all[~mask_patch]
+    true_out = usol_mat[~mask_patch]
+    err_out = np.linalg.norm(diff_out) / np.linalg.norm(true_out)
+
+    return err_all, err_patch, err_out, mask_patch
+
 # --- Data Preparation ---
 # Automatically calculate the file path
 try:
@@ -331,58 +397,102 @@ print('FourierPINN Training time: %.2f seconds' % (elapsed))
 error_vec, u_pred = pinn_fourier.test()
 print('FourierPINN Test Error: %.5f' % (error_vec))
 
+print("\n--- Baseline (before wavelet correction) ---")
+# u_pred: (Nx,Nt) ； usol: (Nx,Nt)
+indicator = wavelet_shock_indicator(u_pred, wavelet='db4', level=3)
+
+lb_patch, ub_patch = detect_shock_patch(
+    indicator,
+    x,
+    t,
+    threshold=0.5,
+    x_margin_ratio=0.1,
+    t_margin_ratio=0.1
+)
+
+err_all_base, err_patch_base, err_out_base, mask_patch = compute_region_errors(
+    u_pred_mat=u_pred,
+    usol_mat=usol,
+    x_grid=x,
+    t_grid=t,
+    lb_patch=lb_patch,
+    ub_patch=ub_patch
+)
+print("Baseline shock patch lb =", lb_patch, ", ub =", ub_patch)
+print(f"[Baseline] Global  rel L2 error : {err_all_base:.5e}")
+print(f"[Baseline] Patch   rel L2 error : {err_patch_base:.5e}")
+print(f"[Baseline] Outside rel L2 error : {err_out_base:.5e}")
+
+
 # Wavelet
-print("\n--- Wavelet-based shock detection & local refinement ---")
+print("\n--- Wavelet-based shock detection & localized correction ---")
 Nx, Nt = u_pred.shape
 x_vec = x
 t_vec = t
 indicator = wavelet_shock_indicator(u_pred, wavelet='db4', level=3)
 lb_patch, ub_patch = detect_shock_patch(indicator, x, t,threshold=0.5,x_margin_ratio=0.1,t_margin_ratio=0.1)
-X_interior_np = sample_points_in_patch(lb_patch, ub_patch, N_interior=4000)
-X_b_np = sample_patch_boundary(lb_patch, ub_patch, N_each_side=100)
-X_interior = torch.from_numpy(X_interior_np).float().to(device)
-X_b = torch.from_numpy(X_b_np).float().to(device)
-with torch.no_grad():
-    U_b = pinn_fourier.forward(X_b)
-local_layers = [2, 64, 64, 64, 1]
-local_pinn = WavePINN(local_layers, nu=nu, device=device).to(device)
-optimizer = torch.optim.Adam(local_pinn.parameters(), lr=1e-3)
+Nx_c, Nt_c = 8, 4  # the center of wavelet
+x_centers = np.linspace(lb_patch[0], ub_patch[0], Nx_c)
+t_centers = np.linspace(lb_patch[1], ub_patch[1], Nt_c)
 
-for it in range(5000):
-    optimizer.zero_grad()
+centers_list = []
+for xc in x_centers:
+    for tc in t_centers:
+        centers_list.append([xc, tc])
+centers_np = np.array(centers_list, dtype=np.float32)
+M = centers_np.shape[0]
 
-    # PDE loss
-    f_interior = local_pinn.pde_residual(X_interior)
-    loss_pde = torch.mean(f_interior**2)
+x_scale = (ub_patch[0] - lb_patch[0]) / Nx_c
+t_scale = (ub_patch[1] - lb_patch[1]) / Nt_c
+scales_np = np.tile(np.array([[x_scale, t_scale]], dtype=np.float32), (M, 1))
 
-    # boundary loss
-    u_b_pred = local_pinn(X_b)
-    loss_b = torch.mean((u_b_pred - U_b)**2)
+centers_tensor = torch.from_numpy(centers_np).to(device)
+scales_tensor = torch.from_numpy(scales_np).to(device)
 
-    loss = loss_pde + loss_b
+wavelet_features = WaveletFeatures(centers_tensor, scales_tensor).to(device)
+wavelet_correction = WavePINN(wavelet_features, M).to(device)
+
+for p in pinn_fourier.parameters():
+    p.requires_grad = False
+optimizer_w = torch.optim.Adam(wavelet_correction.parameters(), lr=1e-3)
+lambda_b = 1.0  # bound loss
+steps_wavelet = 5000
+for it in range(steps_wavelet):
+    optimizer_w.zero_grad()
+
+    f_pde = pde_residual_wavelet(X_pde)
+    loss_pde = torch.mean(f_pde**2)
+
+    u_b = u_total(X_boundary)
+    loss_b = torch.mean((u_b - U_boundary)**2)
+
+    loss = loss_pde + lambda_b * loss_b
     loss.backward()
-    optimizer.step()
+    optimizer_w.step()
 
     if it % 500 == 0:
-        print(f"[Local] iter {it}, loss={loss.item():.3e}, pde={loss_pde.item():.3e}, b={loss_b.item():.3e}")
+        print(f"[Wavelet] iter {it}, loss={loss.item():.3e}, "
+              f"pde={loss_pde.item():.3e}, b={loss_b.item():.3e}")
 
-# Combination
-X_test_np = np.hstack((X.flatten()[:,None], T.flatten()[:,None]))
-X_test = torch.from_numpy(X_test_np).float().to(device)
+print("--- Wavelet correction finished ---")
+
 with torch.no_grad():
-    u_global = pinn_fourier.forward(X_test).cpu().numpy()
-u_refined = u_global.copy()
-x_flat = X_test_np[:,0]
-t_flat = X_test_np[:,1]
-mask = (
-    (x_flat >= lb_patch[0]) & (x_flat <= ub_patch[0]) &
-    (t_flat >= lb_patch[1]) & (t_flat <= ub_patch[1])
+    u_pred_total = u_total(X_test).cpu().numpy()
+u_pred_total = np.reshape(u_pred_total, (256, 100), order='F')
+
+err_all_w, err_patch_w, err_out_w, _ = compute_region_errors(
+    u_pred_mat=u_pred_total,
+    usol_mat=usol,
+    x_grid=x,
+    t_grid=t,
+    lb_patch=lb_patch,
+    ub_patch=ub_patch
 )
-X_patch_all = X_test[mask, :]
-with torch.no_grad():
-    u_local_patch = local_pinn(X_patch_all).cpu().numpy()
-u_refined[mask, :] = u_local_patch
-u_refined_grid = u_refined.reshape(X.shape[0], X.shape[1], order='F')
+
+print("=== After wavelet correction ===")
+print(f"[Wavelet] Global  rel L2 error : {err_all_w:.5e}")
+print(f"[Wavelet] Patch   rel L2 error : {err_patch_w:.5e}")
+print(f"[Wavelet] Outside rel L2 error : {err_out_w:.5e}")
 
 # --- plots ---
 solutionplot(u_pred, X_pde.cpu().detach().numpy(), usol, x, t)
