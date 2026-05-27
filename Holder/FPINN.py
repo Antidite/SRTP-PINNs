@@ -90,19 +90,18 @@ class FourierPINN(nn.Module):
         return self.loss_function(u_pred, u)
 
     def loss_PDE(self, X_train_Nf):
-        g = X_train_Nf.clone()
-        g.requires_grad = True
+        g = X_train_Nf.clone().detach().requires_grad_(True)
         u = self.forward(g)
-        u_x_t = autograd.grad(u, g, torch.ones([X_train_Nf.shape[0], 1]).to(device),
-                              retain_graph=True, create_graph=True)[0]
-        u_xx_tt = autograd.grad(u_x_t, g, torch.ones(X_train_Nf.shape).to(device),
-                                create_graph=True)[0]
-        u_x = u_x_t[:, [0]]
-        u_t = u_x_t[:, [1]]
-        u_xx = u_xx_tt[:, [0]]
 
-        f = u_t + (self.forward(g)) * (u_x) - (nu) * u_xx
-        loss_f = self.loss_function(f, f_hat)
+        grads = autograd.grad(u,g,torch.ones_like(u),retain_graph=True,create_graph=True)[0]
+        u_x = grads[:, [0]]
+        u_t = grads[:, [1]]
+
+        grads_x = autograd.grad(u_x,g,torch.ones_like(u_x),retain_graph=True,create_graph=True)[0]
+        u_xx = grads_x[:, [0]]
+
+        f = u_t + u * u_x - nu * u_xx
+        loss_f = self.loss_function(f, torch.zeros_like(f))
 
         return loss_f
 
@@ -271,9 +270,7 @@ def sample_patch_boundary(lb_patch, ub_patch, N_each_side):
     return X_b
 
 def u_total(X):
-    # X: (N,2) tensor
-    with torch.no_grad():
-        u_global = pinn_fourier(X)
+    u_global = pinn_fourier(X)
     delta_u = wavelet_correction(X)
     return u_global + delta_u
 
@@ -350,12 +347,12 @@ left_X = np.hstack((X[0, :][:, None], T[0, :][:, None]))
 left_U = usol[:, 0][:, None]
 
 # x = -1 and 0 <= t <= 1
-bottom_X = np.hstack((X[:, 0][:, None], T[:, 0][:, None]))  # L2
-bottom_U = usol[-1, :][:, None]
+bottom_X = np.hstack((X[:, 0][:, None], T[:, 0][:, None]))
+bottom_U = usol[0, :][:, None]
 
 # x = 1 and 0 <= t <= 1
-top_X = np.hstack((X[:, -1][:, None], T[:, 0][:, None]))  # L3
-top_U = usol[0, :][:, None]
+top_X = np.hstack((X[:, -1][:, None], T[:, -1][:, None]))
+top_U = usol[-1, :][:, None]
 
 X_train = np.vstack([left_X, bottom_X, top_X])
 U_train = np.vstack([left_U, bottom_U, top_U])
