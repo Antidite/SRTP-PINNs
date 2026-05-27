@@ -124,10 +124,11 @@ class FourierPINN(nn.Module):
         return loss
 
     def test(self):
-        u_pred = self.forward(X_test)
-        error_vec = torch.linalg.norm((u - u_pred), 2) / torch.linalg.norm(u, 2)
-        u_pred = u_pred.cpu().detach().numpy()
-        u_pred = np.reshape(u_pred, (256, 100), order='F')
+        with torch.no_grad():
+            u_pred = self.forward(X_test)
+            error_vec = torch.linalg.norm((u - u_pred), 2) / torch.linalg.norm(u, 2)
+            u_pred = u_pred.cpu().detach().numpy()
+            u_pred = np.reshape(u_pred, (256, 100), order='F')
 
         return error_vec, u_pred
 
